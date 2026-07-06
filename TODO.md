@@ -46,7 +46,3 @@
 - [ ] Check availability target of 99.5%.
 - [ ] Verify memory behavior under load.
 
-## Nice to Have
-- [ ] Add a second CGI handler.
-- [ ] Add an admin dashboard or server metrics endpoint.
-- [ ] Improve README usage and config examples.

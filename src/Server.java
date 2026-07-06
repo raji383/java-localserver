@@ -165,6 +165,14 @@ public class Server {
             return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
         }
 
+        if (isBodyTooLarge(routeMatch.route, parsedRequest)) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 413, "Request Entity Too Large");
+        }
+
+        if (routeMatch == null) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+        }
+
         if (routeMatch.statusCode == 405) {
             return HttpResponseBuilder.buildErrorResponse(parsedRequest, 405, "Method Not Allowed");
         }
@@ -186,6 +194,19 @@ public class Server {
 
         String responseBody = "Request received: " + parsedRequest.method + " " + parsedRequest.target;
         return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", responseBody, "text/plain; charset=utf-8");
+    }
+
+    private boolean isBodyTooLarge(Route route, HttpRequestParser.ParsedRequest parsedRequest) {
+        if (parsedRequest == null || parsedRequest.contentLength <= 0) {
+            return false;
+        }
+
+        long limit = Long.MAX_VALUE;
+        if (route != null && route.client_body_limit != null) {
+            limit = route.client_body_limit;
+        }
+
+        return parsedRequest.contentLength > limit;
     }
 
     private String serveStaticFile(Route route, HttpRequestParser.ParsedRequest parsedRequest) {
