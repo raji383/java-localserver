@@ -69,6 +69,39 @@ public class Server {
         serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT, endpoint);
     }
 
+    ServerConfig selectServerForConnection(String host, int port, ServerConfig fallback) {
+        if (host == null || host.isBlank()) {
+            host = "0.0.0.0";
+        }
+
+        String normalizedHost = normalizeHost(host);
+        for (ServerConfig serverConfig : serverConfigs) {
+            if (serverConfig == null || serverConfig.ports == null || serverConfig.ports.isEmpty()) {
+                continue;
+            }
+            if (matchesServer(serverConfig, normalizedHost, port)) {
+                return serverConfig;
+            }
+        }
+        return fallback != null ? fallback : serverConfigs.isEmpty() ? null : serverConfigs.get(0);
+    }
+
+    private boolean matchesServer(ServerConfig serverConfig, String host, int port) {
+        if (serverConfig == null || serverConfig.ports == null || serverConfig.ports.isEmpty()) {
+            return false;
+        }
+        String normalizedHost = normalizeHost(serverConfig.host);
+        if (!normalizedHost.equals("0.0.0.0") && !normalizedHost.equals(host)) {
+            return false;
+        }
+        for (Integer configuredPort : serverConfig.ports) {
+            if (configuredPort != null && configuredPort == port) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private String normalizeHost(String host) {
         return host == null || host.isBlank() ? "0.0.0.0" : host;
     }
@@ -103,7 +136,9 @@ public class Server {
         }
 
         socketChannel.configureBlocking(false);
-        ConnectionState connectionState = new ConnectionState((Endpoint) key.attachment());
+        Endpoint endpoint = (Endpoint) key.attachment();
+        ServerConfig selectedServerConfig = selectServerForConnection(endpoint.host, endpoint.port, endpoint.serverConfig);
+        ConnectionState connectionState = new ConnectionState(new Endpoint(endpoint.host, endpoint.port, selectedServerConfig));
         socketChannel.register(selector, SelectionKey.OP_READ, connectionState);
     }
 
