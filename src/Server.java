@@ -227,6 +227,10 @@ public class Server {
             }
         }
 
+        if (routeMatch.route != null && routeMatch.route.cgi_extensions != null && !routeMatch.route.cgi_extensions.isEmpty()) {
+            return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", "CGI handler pending", "text/plain; charset=utf-8");
+        }
+
         String responseBody = "Request received: " + parsedRequest.method + " " + parsedRequest.target;
         return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", responseBody, "text/plain; charset=utf-8");
     }
