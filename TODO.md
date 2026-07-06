@@ -9,11 +9,11 @@
 - [x] Serve static files safely with path normalization and directory traversal protection.
 
 ## Config and Routing
-- [ ] Load and validate config at startup.
-- [ ] Support host and multiple ports.
+- [x] Load and validate config at startup.
+- [x] Support host and multiple ports.
 - [ ] Support default server selection.
 - [ ] Support custom error page paths.
-- [ ] Support client body size limits.
+- [x] Support client body size limits.
 - [ ] Support routes with accepted methods, redirections, roots, default files, CGI extensions, and directory listing toggle.
 
 ## Uploads, Cookies, and Sessions

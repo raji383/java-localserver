@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 
 public class Config {
     public List<ServerConfig> servers;
@@ -33,12 +34,12 @@ public class Config {
         index = 0;
         Object root = parseValue();
         if (!(root instanceof Map)) {
-            return List.of();
+            throw new IllegalArgumentException("Config must be a JSON object");
         }
 
         Object serversNode = ((Map<?, ?>) root).get("servers");
         if (!(serversNode instanceof List)) {
-            return List.of();
+            throw new IllegalArgumentException("Config must contain a 'servers' array");
         }
 
         List<ServerConfig> parsedServers = new ArrayList<>();
@@ -46,6 +47,9 @@ public class Config {
             if (serverNode instanceof Map) {
                 parsedServers.add(parseServer((Map<?, ?>) serverNode));
             }
+        }
+        if (parsedServers.isEmpty()) {
+            throw new IllegalArgumentException("Config must define at least one server");
         }
         return parsedServers;
     }
@@ -57,6 +61,24 @@ public class Config {
         Map<String, String> errorPages = toStringMap(serverNode.get("error_pages"));
         long clientBodyLimit = asLong(serverNode.get("client_body_limit"));
         List<Route> routes = toRouteList(serverNode.get("routes"));
+
+        if (host == null || host.isBlank()) {
+            throw new IllegalArgumentException("Server host must be provided");
+        }
+        if (ports == null || ports.isEmpty()) {
+            throw new IllegalArgumentException("Server must define at least one port");
+        }
+        for (Integer port : ports) {
+            if (port == null || port < 1 || port > 65535) {
+                throw new IllegalArgumentException("Server port must be between 1 and 65535");
+            }
+        }
+        if (routes == null || routes.isEmpty()) {
+            throw new IllegalArgumentException("Server must define at least one route");
+        }
+        if (clientBodyLimit < 0) {
+            throw new IllegalArgumentException("client_body_limit must be non-negative");
+        }
 
         return new ServerConfig(host, ports, serverName, errorPages, clientBodyLimit, routes);
     }
@@ -85,6 +107,30 @@ public class Config {
         route.client_body_limit = asLongObject(routeNode.get("client_body_limit"));
         route.cgi_extensions = toStringList(routeNode.get("cgi_extensions"));
         route.redirect = asString(routeNode.get("redirect"));
+
+        if (route.path == null || route.path.isBlank()) {
+            throw new IllegalArgumentException("Route path must be provided");
+        }
+        if (!route.path.startsWith("/")) {
+            throw new IllegalArgumentException("Route path must start with '/'");
+        }
+        if (route.redirect != null && !route.redirect.isBlank() && !route.redirect.startsWith("/")) {
+            throw new IllegalArgumentException("Redirect target must start with '/'");
+        }
+        if (route.client_body_limit != null && route.client_body_limit < 0) {
+            throw new IllegalArgumentException("Route client_body_limit must be non-negative");
+        }
+        if (route.methods != null && !route.methods.isEmpty()) {
+            for (String method : route.methods) {
+                if (method == null || method.isBlank()) {
+                    continue;
+                }
+                String upperMethod = method.trim().toUpperCase(Locale.ROOT);
+                if (!upperMethod.equals("GET") && !upperMethod.equals("POST") && !upperMethod.equals("DELETE")) {
+                    throw new IllegalArgumentException("Unsupported HTTP method in route: " + method);
+                }
+            }
+        }
         return route;
     }
 
