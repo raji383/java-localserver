@@ -1,0 +1,93 @@
+{
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "ports": [8080 ],
+      "server_name": "localhost",
+      "error_pages": {
+        "400": "error_pages/400.html",
+        "403": "error_pages/403.html",
+        "404": "error_pages/404.html",
+        "405": "error_pages/405.html",
+        "413": "error_pages/413.html",
+        "500": "error_pages/500.html"
+      },
+      "client_body_limit": 1048576,
+      "routes": [
+        {
+          "path": "/",
+          "root": "www",
+          "default_file": "index.html",
+          "methods": ["GET","DELETE","POST"],
+          "directory_listing": true
+        },
+        {
+          "path": "/upload",
+          "root": "uploads",
+          "methods": ["GET", "POST", "DELETE"],
+          "client_body_limit": 21474836480
+        },
+        {
+
+          "path": "/ddd",
+          "root": "www",
+          "default_file": "index.html",
+          "methods": ["GET","DELETE","POST"],
+          "directory_listing": false
+        },
+        {
+          "path": "/cgi",
+          "root": "cgi",
+          "methods": ["GET","POST","DELETE"],
+          "cgi_extensions": [".py"],
+          "client_body_limit": 21474836480
+        },
+        {
+          "path": "/redirect",
+          "redirect": "/",
+          "methods": ["GET"]
+        }
+      ]
+    },{
+      "host": "127.0.0.1",
+      "ports": [8080,8081],
+      "server_name": "jjjjj",
+      "error_pages": {
+        "400": "error_pages/400.html",
+        "403": "error_pages/403.html",
+        "404": "error_pages/404.html",
+        "405": "error_pages/405.html",
+        "413": "error_pages/413.html",
+        "500": "error_pages/500.html"
+      },
+      "client_body_limit": 1048576,
+      "routes": [
+        {
+          "path": "/",
+          "root": "www",
+          "default_file": "index.html",
+          "methods": ["GET"],
+          "directory_listing": false
+        },
+        {
+          "path": "/upload",
+          "root": "uploads",
+          "methods": ["GET", "POST", "DELETE"],
+          "client_body_limit": 21474836480
+        },
+        {
+          "path": "/cgi",
+          "root": "cgi",
+          "methods": ["GET","POST","DELETE"],
+          "cgi_extensions": [".py"],
+          "client_body_limit": 21474836480
+        },
+        {
+          "path": "/redirect",
+          "redirect": "/",
+          "methods": ["GET"]
+        }
+      ]
+    }
+  ]
+}
