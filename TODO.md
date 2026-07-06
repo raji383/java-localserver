@@ -5,8 +5,8 @@
 - [x] Support listening on multiple ports with one `ServerSocketChannel` per configured port.
 - [x] Parse HTTP/1.1 requests manually: start line, headers, body, cookies, and chunked transfer encoding.
 - [x] Implement HTTP response building: status line, headers, content length, keep-alive, and body.
-- [ ] Add routing for `GET`, `POST`, and `DELETE` with per-route configuration matching.
-- [ ] Serve static files safely with path normalization and directory traversal protection.
+- [x] Add routing for `GET`, `POST`, and `DELETE` with per-route configuration matching.
+- [x] Serve static files safely with path normalization and directory traversal protection.
 
 ## Config and Routing
 - [ ] Load and validate config at startup.

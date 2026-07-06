@@ -22,6 +22,23 @@ public class HttpResponseBuilder {
         return buildResponse(parsedRequest, statusCode, reasonPhrase, body, "text/plain; charset=utf-8");
     }
 
+    public static String buildRedirectResponse(HttpRequestParser.ParsedRequest parsedRequest, String location) {
+        String body = "Redirecting to " + location;
+        byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+        String responseVersion = responseVersion(parsedRequest);
+        String connectionHeader = shouldKeepAlive(parsedRequest) ? "keep-alive" : "close";
+
+        StringBuilder responseBuilder = new StringBuilder();
+        responseBuilder.append(responseVersion).append(' ').append(302).append(' ').append("Found").append("\r\n");
+        responseBuilder.append("Content-Type: text/plain; charset=utf-8\r\n");
+        responseBuilder.append("Content-Length: ").append(bodyBytes.length).append("\r\n");
+        responseBuilder.append("Connection: ").append(connectionHeader).append("\r\n");
+        responseBuilder.append("Location: ").append(location).append("\r\n");
+        responseBuilder.append("\r\n");
+        responseBuilder.append(body);
+        return responseBuilder.toString();
+    }
+
     private static boolean shouldKeepAlive(HttpRequestParser.ParsedRequest parsedRequest) {
         if (parsedRequest == null || parsedRequest.version == null) {
             return false;

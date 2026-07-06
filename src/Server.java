@@ -8,6 +8,8 @@ import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -130,7 +132,7 @@ public class Server {
             return;
         }
 
-        connectionState.responseBuffer = ByteBuffer.wrap(buildResponse(parsedRequest).getBytes(StandardCharsets.UTF_8));
+        connectionState.responseBuffer = ByteBuffer.wrap(buildResponse(connectionState.endpoint.serverConfig, parsedRequest).getBytes(StandardCharsets.UTF_8));
         key.interestOps(SelectionKey.OP_WRITE);
     }
 
@@ -149,7 +151,7 @@ public class Server {
         return HttpRequestParser.parseRequest(requestBytes);
     }
 
-    private String buildResponse(HttpRequestParser.ParsedRequest parsedRequest) {
+    String buildResponse(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest) {
         if (!parsedRequest.valid) {
             return HttpResponseBuilder.buildErrorResponse(parsedRequest, 400, "Bad Request");
         }
@@ -158,8 +160,154 @@ public class Server {
             return HttpResponseBuilder.buildErrorResponse(parsedRequest, 405, "Method Not Allowed");
         }
 
+        Router.RouteMatch routeMatch = Router.matchRoute(serverConfig, parsedRequest);
+        if (routeMatch == null) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+        }
+
+        if (routeMatch.statusCode == 405) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 405, "Method Not Allowed");
+        }
+
+        if (routeMatch.statusCode == 404) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+        }
+
+        if (routeMatch.statusCode == 302) {
+            return HttpResponseBuilder.buildRedirectResponse(parsedRequest, routeMatch.redirectTarget);
+        }
+
+        if ("GET".equals(parsedRequest.method)) {
+            String staticResponse = serveStaticFile(routeMatch.route, parsedRequest);
+            if (staticResponse != null) {
+                return staticResponse;
+            }
+        }
+
         String responseBody = "Request received: " + parsedRequest.method + " " + parsedRequest.target;
         return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", responseBody, "text/plain; charset=utf-8");
+    }
+
+    private String serveStaticFile(Route route, HttpRequestParser.ParsedRequest parsedRequest) {
+        if (route == null || route.root == null || route.root.isBlank()) {
+            return null;
+        }
+
+        Path rootPath = Path.of(route.root).toAbsolutePath().normalize();
+        if (!Files.exists(rootPath)) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+        }
+
+        Path requestedPath = resolveRequestedPath(route, parsedRequest.path);
+        if (requestedPath == null) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 403, "Forbidden");
+        }
+
+        Path resolvedPath = rootPath.resolve(requestedPath).normalize();
+        if (!isPathWithinRoot(rootPath, resolvedPath)) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 403, "Forbidden");
+        }
+
+        if (Files.isDirectory(resolvedPath)) {
+            if (route.default_file != null && !route.default_file.isBlank()) {
+                Path defaultFile = resolvedPath.resolve(route.default_file).normalize();
+                if (Files.isRegularFile(defaultFile) && isPathWithinRoot(rootPath, defaultFile)) {
+                    return serveFile(parsedRequest, defaultFile);
+                }
+            }
+
+            if (Boolean.TRUE.equals(route.directory_listing)) {
+                return buildDirectoryListing(parsedRequest, resolvedPath);
+            }
+            
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 403, "Forbidden");
+        }
+
+        if (!Files.isRegularFile(resolvedPath)) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+        }
+
+        return serveFile(parsedRequest, resolvedPath);
+    }
+
+    private Path resolveRequestedPath(Route route, String requestPath) {
+        String normalizedPath = normalizePath(requestPath);
+        if (route == null || route.path == null || route.path.isBlank() || "/".equals(route.path)) {
+            return Path.of(normalizedPath.equals("/") ? "" : normalizedPath.substring(1));
+        }
+
+        String routePrefix = normalizePath(route.path);
+        if (normalizedPath.equals(routePrefix)) {
+            return Path.of("");
+        }
+        if (!normalizedPath.startsWith(routePrefix + "/")) {
+            return null;
+        }
+        String remainder = normalizedPath.substring(routePrefix.length());
+        return Path.of(remainder.startsWith("/") ? remainder.substring(1) : remainder);
+    }
+
+    private String serveFile(HttpRequestParser.ParsedRequest parsedRequest, Path filePath) {
+        try {
+            String content = Files.readString(filePath, StandardCharsets.UTF_8);
+            String contentType = determineContentType(filePath);
+            return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", content, contentType);
+        } catch (IOException exception) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+        }
+    }
+
+    private String buildDirectoryListing(HttpRequestParser.ParsedRequest parsedRequest, Path directoryPath) {
+        try {
+            StringBuilder builder = new StringBuilder();
+            builder.append("<html><body><h1>Directory listing</h1><ul>");
+            for (Path entry : Files.list(directoryPath).sorted().toList()) {
+                String entryName = entry.getFileName().toString();
+                builder.append("<li><a href=\"").append(entryName).append("\">")
+                        .append(entryName)
+                        .append("</a></li>");
+            }
+            builder.append("</ul></body></html>");
+            return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", builder.toString(), "text/html; charset=utf-8");
+        } catch (IOException exception) {
+            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 500, "Internal Server Error");
+        }
+    }
+
+    private boolean isPathWithinRoot(Path rootPath, Path resolvedPath) {
+        try {
+            return resolvedPath.toAbsolutePath().normalize().startsWith(rootPath.toAbsolutePath().normalize());
+        } catch (Exception exception) {
+            return false;
+        }
+    }
+
+    private String determineContentType(Path filePath) {
+        String fileName = filePath.getFileName().toString().toLowerCase();
+        if (fileName.endsWith(".html") || fileName.endsWith(".htm")) {
+            return "text/html; charset=utf-8";
+        }
+        if (fileName.endsWith(".txt") || fileName.endsWith(".md")) {
+            return "text/plain; charset=utf-8";
+        }
+        if (fileName.endsWith(".json")) {
+            return "application/json; charset=utf-8";
+        }
+        return "application/octet-stream";
+    }
+
+    private String normalizePath(String path) {
+        if (path == null || path.isBlank()) {
+            return "/";
+        }
+        String normalizedPath = path.startsWith("/") ? path : "/" + path;
+        while (normalizedPath.contains("//")) {
+            normalizedPath = normalizedPath.replace("//", "/");
+        }
+        if (normalizedPath.length() > 1 && normalizedPath.endsWith("/")) {
+            normalizedPath = normalizedPath.substring(0, normalizedPath.length() - 1);
+        }
+        return normalizedPath;
     }
 
     private boolean isSupportedMethod(String method) {

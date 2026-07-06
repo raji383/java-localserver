@@ -29,7 +29,7 @@
         },
         {
 
-          "path": "/ddd",
+          "path": "/add",
           "root": "www",
           "default_file": "index.html",
           "methods": ["GET","DELETE","POST"],
