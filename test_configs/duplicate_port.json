@@ -1,0 +1,19 @@
+{
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "ports": [18083, 18083],
+      "server_name": "duplicate",
+      "error_pages": {},
+      "client_body_limit": 100,
+      "routes": [
+        {
+          "path": "/",
+          "root": "test_www",
+          "default_file": "index.html",
+          "methods": ["GET"]
+        }
+      ]
+    }
+  ]
+}

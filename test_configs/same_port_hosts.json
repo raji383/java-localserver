@@ -1,0 +1,34 @@
+{
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "ports": [18084],
+      "server_name": "a.test",
+      "error_pages": {},
+      "client_body_limit": 100,
+      "routes": [
+        {
+          "path": "/",
+          "root": "test_www",
+          "default_file": "index.html",
+          "methods": ["GET"]
+        }
+      ]
+    },
+    {
+      "host": "127.0.0.1",
+      "ports": [18084],
+      "server_name": "b.test",
+      "error_pages": {},
+      "client_body_limit": 100,
+      "routes": [
+        {
+          "path": "/",
+          "root": "test_www/subdir",
+          "default_file": "index.html",
+          "methods": ["GET"]
+        }
+      ]
+    }
+  ]
+}

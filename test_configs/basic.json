@@ -1,0 +1,58 @@
+{
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "ports": [18080],
+      "server_name": "localhost",
+      "error_pages": {
+        "400": "error_pages/400.html",
+        "403": "error_pages/403.html",
+        "404": "error_pages/404.html",
+        "405": "error_pages/405.html",
+        "413": "error_pages/413.html",
+        "500": "error_pages/500.html"
+      },
+      "client_body_limit": 100,
+      "routes": [
+        {
+          "path": "/",
+          "root": "test_www",
+          "default_file": "index.html",
+          "methods": ["GET"],
+          "directory_listing": false
+        },
+        {
+          "path": "/list",
+          "root": "test_www/list",
+          "methods": ["GET"],
+          "directory_listing": true
+        },
+        {
+          "path": "/limited",
+          "root": "test_www",
+          "methods": ["POST"],
+          "client_body_limit": 5
+        },
+        {
+          "path": "/upload",
+          "root": "test_uploads",
+          "methods": ["GET", "POST", "DELETE"],
+          "directory_listing": true,
+          "client_body_limit": 100
+        },
+        {
+          "path": "/cgi",
+          "root": "test_cgi",
+          "methods": ["GET", "POST"],
+          "cgi_extensions": [".py"],
+          "client_body_limit": 100
+        },
+        {
+          "path": "/redirect",
+          "redirect": "/",
+          "methods": ["GET"]
+        }
+      ]
+    }
+  ]
+}

@@ -49,6 +49,9 @@ public class HttpRequestParser {
 
         int bodyStartIndex = headerBoundary.index + headerBoundary.separatorLength;
         int contentLength = parseContentLength(headers.get("content-length"));
+        if (contentLength < 0) {
+            return ParsedRequest.invalid();
+        }
         boolean chunked = headers.containsKey("transfer-encoding")
                 && headers.get("transfer-encoding").toLowerCase().contains("chunked");
 

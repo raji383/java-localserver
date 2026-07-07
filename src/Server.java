@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 
 public class Server {
@@ -167,7 +168,8 @@ public class Server {
             return;
         }
 
-        connectionState.responseBuffer = ByteBuffer.wrap(buildResponse(connectionState.endpoint.serverConfig, parsedRequest).getBytes(StandardCharsets.UTF_8));
+        ServerConfig serverConfig = selectServerForRequest(connectionState.endpoint, parsedRequest);
+        connectionState.responseBuffer = ByteBuffer.wrap(buildResponse(serverConfig, parsedRequest).getBytes(StandardCharsets.UTF_8));
         key.interestOps(SelectionKey.OP_WRITE);
     }
 
@@ -186,108 +188,204 @@ public class Server {
         return HttpRequestParser.parseRequest(requestBytes);
     }
 
+    private ServerConfig selectServerForRequest(Endpoint endpoint, HttpRequestParser.ParsedRequest parsedRequest) {
+        String hostHeader = parsedRequest.headers.getOrDefault("host", "");
+        String requestedHost = hostHeader.split(":", 2)[0].trim().toLowerCase(Locale.ROOT);
+
+        for (ServerConfig serverConfig : serverConfigs) {
+            if (listensOn(serverConfig, endpoint.port) && requestedHost.equalsIgnoreCase(serverConfig.server_name)) {
+                return serverConfig;
+            }
+        }
+        for (ServerConfig serverConfig : serverConfigs) {
+            if (listensOn(serverConfig, endpoint.port) && requestedHost.equalsIgnoreCase(normalizeHost(serverConfig.host))) {
+                return serverConfig;
+            }
+        }
+        return endpoint.serverConfig;
+    }
+
+    private boolean listensOn(ServerConfig serverConfig, int port) {
+        if (serverConfig == null || serverConfig.ports == null) {
+            return false;
+        }
+        for (Integer configuredPort : serverConfig.ports) {
+            if (configuredPort != null && configuredPort == port) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     String buildResponse(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest) {
         if (!parsedRequest.valid) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 400, "Bad Request");
+            return error.build(serverConfig, parsedRequest, 400, "Bad Request");
         }
 
         if (!isSupportedMethod(parsedRequest.method)) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 405, "Method Not Allowed");
+            return error.build(serverConfig, parsedRequest, 405, "Method Not Allowed");
         }
 
         Router.RouteMatch routeMatch = Router.matchRoute(serverConfig, parsedRequest);
         if (routeMatch == null) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+            return error.build(serverConfig, parsedRequest, 404, "Not Found");
         }
 
-        if (isBodyTooLarge(routeMatch.route, parsedRequest)) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 413, "Request Entity Too Large");
+        if (isBodyTooLarge(serverConfig, routeMatch.route, parsedRequest)) {
+            return error.build(serverConfig, parsedRequest, 413, "Request Entity Too Large");
         }
 
         if (routeMatch == null) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+            return error.build(serverConfig, parsedRequest, 404, "Not Found");
         }
 
         if (routeMatch.statusCode == 405) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 405, "Method Not Allowed");
+            return error.build(serverConfig, parsedRequest, 405, "Method Not Allowed");
         }
 
         if (routeMatch.statusCode == 404) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+            return error.build(serverConfig, parsedRequest, 404, "Not Found");
         }
 
         if (routeMatch.statusCode == 302) {
             return HttpResponseBuilder.buildRedirectResponse(parsedRequest, routeMatch.redirectTarget);
         }
 
+        if (routeMatch.route != null && routeMatch.route.cgi_extensions != null && !routeMatch.route.cgi_extensions.isEmpty()) {
+            String cgiResponse = CGIHandler.handle(routeMatch.route, parsedRequest);
+            if (cgiResponse != null) {
+                return cgiResponse;
+            }
+        }
+
         if ("GET".equals(parsedRequest.method)) {
-            String staticResponse = serveStaticFile(routeMatch.route, parsedRequest);
+            String staticResponse = serveStaticFile(serverConfig, routeMatch.route, parsedRequest);
             if (staticResponse != null) {
                 return staticResponse;
             }
         }
 
-        if (routeMatch.route != null && routeMatch.route.cgi_extensions != null && !routeMatch.route.cgi_extensions.isEmpty()) {
-            return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", "CGI handler pending", "text/plain; charset=utf-8");
+        if ("POST".equals(parsedRequest.method)) {
+            return saveUpload(serverConfig, routeMatch.route, parsedRequest);
+        }
+
+        if ("DELETE".equals(parsedRequest.method)) {
+            return deleteResource(serverConfig, routeMatch.route, parsedRequest);
         }
 
         String responseBody = "Request received: " + parsedRequest.method + " " + parsedRequest.target;
         return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", responseBody, "text/plain; charset=utf-8");
     }
 
-    private boolean isBodyTooLarge(Route route, HttpRequestParser.ParsedRequest parsedRequest) {
-        if (parsedRequest == null || parsedRequest.contentLength <= 0) {
+    private boolean isBodyTooLarge(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
+        if (parsedRequest == null) {
             return false;
         }
-
-        long limit = Long.MAX_VALUE;
-        if (route != null && route.client_body_limit != null) {
-            limit = route.client_body_limit;
-        }
-
-        return parsedRequest.contentLength > limit;
+        long limit = route != null && route.client_body_limit != null
+                ? route.client_body_limit
+                : serverConfig != null && serverConfig.client_body_limit > 0 ? serverConfig.client_body_limit : Long.MAX_VALUE;
+        int actualSize = parsedRequest.body.getBytes(StandardCharsets.ISO_8859_1).length;
+        int declaredSize = Math.max(parsedRequest.contentLength, actualSize);
+        return declaredSize > limit;
     }
 
-    private String serveStaticFile(Route route, HttpRequestParser.ParsedRequest parsedRequest) {
+    private String saveUpload(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
+        Path target = resolveWritablePath(route, parsedRequest, "upload.bin");
+        if (target == null) {
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
+        }
+
+        try {
+            Files.createDirectories(target.getParent());
+            Files.write(target, parsedRequest.body.getBytes(StandardCharsets.ISO_8859_1));
+            String body = "Uploaded " + target.getFileName();
+            return HttpResponseBuilder.buildResponse(parsedRequest, 201, "Created", body, "text/plain; charset=utf-8");
+        } catch (IOException exception) {
+            return error.build(serverConfig, parsedRequest, 500, "Internal Server Error");
+        }
+    }
+
+    private String deleteResource(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
+        Path target = resolveWritablePath(route, parsedRequest, null);
+        if (target == null) {
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
+        }
+        if (!Files.exists(target)) {
+            return error.build(serverConfig, parsedRequest, 404, "Not Found");
+        }
+        if (Files.isDirectory(target)) {
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
+        }
+
+        try {
+            Files.delete(target);
+            return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", "Deleted", "text/plain; charset=utf-8");
+        } catch (IOException exception) {
+            return error.build(serverConfig, parsedRequest, 500, "Internal Server Error");
+        }
+    }
+
+    private Path resolveWritablePath(Route route, HttpRequestParser.ParsedRequest parsedRequest, String defaultFileName) {
+        if (route == null || route.root == null || route.root.isBlank()) {
+            return null;
+        }
+
+        Path rootPath = Path.of(route.root).toAbsolutePath().normalize();
+        Path requestedPath = resolveRequestedPath(route, parsedRequest.path);
+        if (requestedPath == null) {
+            return null;
+        }
+        if (requestedPath.toString().isBlank()) {
+            if (defaultFileName == null) {
+                return null;
+            }
+            requestedPath = Path.of(defaultFileName);
+        }
+
+        Path target = rootPath.resolve(requestedPath).normalize();
+        return isPathWithinRoot(rootPath, target) ? target : null;
+    }
+
+    private String serveStaticFile(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
         if (route == null || route.root == null || route.root.isBlank()) {
             return null;
         }
 
         Path rootPath = Path.of(route.root).toAbsolutePath().normalize();
         if (!Files.exists(rootPath)) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+            return error.build(serverConfig, parsedRequest, 404, "Not Found");
         }
 
         Path requestedPath = resolveRequestedPath(route, parsedRequest.path);
         if (requestedPath == null) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 403, "Forbidden");
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
         }
 
         Path resolvedPath = rootPath.resolve(requestedPath).normalize();
         if (!isPathWithinRoot(rootPath, resolvedPath)) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 403, "Forbidden");
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
         }
 
         if (Files.isDirectory(resolvedPath)) {
             if (route.default_file != null && !route.default_file.isBlank()) {
                 Path defaultFile = resolvedPath.resolve(route.default_file).normalize();
                 if (Files.isRegularFile(defaultFile) && isPathWithinRoot(rootPath, defaultFile)) {
-                    return serveFile(parsedRequest, defaultFile);
+                    return serveFile(serverConfig, parsedRequest, defaultFile);
                 }
             }
 
             if (Boolean.TRUE.equals(route.directory_listing)) {
-                return buildDirectoryListing(parsedRequest, resolvedPath);
+                return buildDirectoryListing(serverConfig, parsedRequest, resolvedPath);
             }
             
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 403, "Forbidden");
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
         }
 
         if (!Files.isRegularFile(resolvedPath)) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+            return error.build(serverConfig, parsedRequest, 404, "Not Found");
         }
 
-        return serveFile(parsedRequest, resolvedPath);
+        return serveFile(serverConfig, parsedRequest, resolvedPath);
     }
 
     private Path resolveRequestedPath(Route route, String requestPath) {
@@ -307,17 +405,17 @@ public class Server {
         return Path.of(remainder.startsWith("/") ? remainder.substring(1) : remainder);
     }
 
-    private String serveFile(HttpRequestParser.ParsedRequest parsedRequest, Path filePath) {
+    private String serveFile(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest, Path filePath) {
         try {
             String content = Files.readString(filePath, StandardCharsets.UTF_8);
             String contentType = determineContentType(filePath);
             return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", content, contentType);
         } catch (IOException exception) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 404, "Not Found");
+            return error.build(serverConfig, parsedRequest, 404, "Not Found");
         }
     }
 
-    private String buildDirectoryListing(HttpRequestParser.ParsedRequest parsedRequest, Path directoryPath) {
+    private String buildDirectoryListing(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest, Path directoryPath) {
         try {
             StringBuilder builder = new StringBuilder();
             builder.append("<html><body><h1>Directory listing</h1><ul>");
@@ -330,7 +428,7 @@ public class Server {
             builder.append("</ul></body></html>");
             return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", builder.toString(), "text/html; charset=utf-8");
         } catch (IOException exception) {
-            return HttpResponseBuilder.buildErrorResponse(parsedRequest, 500, "Internal Server Error");
+            return error.build(serverConfig, parsedRequest, 500, "Internal Server Error");
         }
     }
 

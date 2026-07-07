@@ -5,6 +5,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Locale;
+import java.util.HashSet;
+import java.util.Set;
 
 public class Config {
     public List<ServerConfig> servers;
@@ -68,9 +70,13 @@ public class Config {
         if (ports == null || ports.isEmpty()) {
             throw new IllegalArgumentException("Server must define at least one port");
         }
+        Set<Integer> seenPorts = new HashSet<>();
         for (Integer port : ports) {
             if (port == null || port < 1 || port > 65535) {
                 throw new IllegalArgumentException("Server port must be between 1 and 65535");
+            }
+            if (!seenPorts.add(port)) {
+                throw new IllegalArgumentException("Duplicate port in server: " + port);
             }
         }
         if (routes == null || routes.isEmpty()) {
