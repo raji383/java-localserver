@@ -4,11 +4,12 @@ import java.util.Map;
 
 public class HttpRequestParser {
     public static ParsedRequest parseRequest(byte[] requestBytes) {
-        if (requestBytes == null || requestBytes.length == 0) {
-            return ParsedRequest.invalid();
-        }
+        try {
+            if (requestBytes == null || requestBytes.length == 0) {
+                return ParsedRequest.invalid();
+            }
 
-        String requestText = new String(requestBytes, StandardCharsets.ISO_8859_1);
+            String requestText = new String(requestBytes, StandardCharsets.ISO_8859_1);
         HeaderBoundary headerBoundary = findHeaderBoundary(requestText);
         if (headerBoundary == null) {
             return null;
@@ -81,6 +82,9 @@ public class HttpRequestParser {
         }
 
         return ParsedRequest.valid(method, target, path, query, version, headers, cookies, body, chunked, contentLength);
+        } catch (Exception exception) {
+            return ParsedRequest.invalid();
+        }
     }
 
     private static HeaderBoundary findHeaderBoundary(String requestText) {

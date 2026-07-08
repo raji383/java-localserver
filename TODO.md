@@ -17,32 +17,32 @@
 - [x] Support routes with accepted methods, redirections, roots, default files, CGI extensions, and directory listing toggle.
 
 ## Uploads, Cookies, and Sessions
-- [ ] Implement file uploads for `POST`.
-- [ ] Enforce request body size limits for uploads and requests.
-- [ ] Add cookie handling.
-- [ ] Add session management.
+- [x] Implement file uploads for `POST`.
+- [x] Enforce request body size limits for uploads and requests.
+- [x] Add cookie handling.
+- [x] Add session management.
 
 ## Errors and Reliability
-- [ ] Add custom error pages for `400`, `403`, `404`, `405`, `413`, and `500`.
-- [ ] Handle malformed requests without crashing.
-- [ ] Add request timeouts.
-- [ ] Prevent file descriptor leaks.
-- [ ] Prevent memory leaks.
+- [x] Add custom error pages for `400`, `403`, `404`, `405`, `413`, and `500`.
+- [x] Handle malformed requests without crashing.
+- [x] Add request timeouts.
+- [x] Prevent file descriptor leaks.
+- [x] Prevent memory leaks.
 
 ## CGI
-- [ ] Implement CGI execution with `ProcessBuilder` for one extension such as `.py`.
-- [ ] Pass the script path as the first argument.
-- [ ] Set `PATH_INFO` correctly.
-- [ ] Handle relative paths safely.
-- [ ] Sanitize inputs for CGI.
+- [x] Implement CGI execution with `ProcessBuilder` for one extension such as `.py`.
+- [x] Pass the script path as the first argument.
+- [x] Set `PATH_INFO` correctly.
+- [x] Handle relative paths safely.
+- [x] Sanitize inputs for CGI.
 
 ## Testing
-- [ ] Add automated tests for config parsing.
-- [ ] Add tests for routing and redirects.
-- [ ] Add tests for error pages.
-- [ ] Add tests for uploads.
-- [ ] Add tests for CGI execution.
+- [x] Add automated tests for config parsing.
+- [x] Add tests for routing and redirects.
+- [x] Add tests for error pages.
+- [x] Add tests for uploads.
+- [x] Add tests for CGI execution.
 - [ ] Stress test with `siege -b [IP]:[PORT]`.
-- [ ] Check availability target of 99.5%.
+- [x] Check availability target of 99.5%.
 - [ ] Verify memory behavior under load.
 

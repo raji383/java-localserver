@@ -10,6 +10,9 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.regex.Pattern;
+import java.net.URLDecoder;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -18,6 +21,8 @@ import java.util.Set;
 public class Server {
     private static final int READ_BUFFER_SIZE = 8192;
     private static final long IDLE_TIMEOUT_MILLIS = 30_000L;
+    private static final long REQUEST_TIMEOUT_MILLIS = 60_000L;
+    private static final int GLOBAL_MAX_REQUEST_BUFFER = 10 * 1024 * 1024; // 10 MB
 
     private final List<ServerConfig> serverConfigs;
 
@@ -161,7 +166,24 @@ public class Server {
         buffer.flip();
         byte[] chunk = new byte[buffer.remaining()];
         buffer.get(chunk);
+        boolean wasEmpty = connectionState.requestBuffer.size() == 0;
         connectionState.requestBuffer.write(chunk);
+        if (wasEmpty) {
+            connectionState.requestStartMillis = System.currentTimeMillis();
+        }
+
+        // Prevent unbounded requestBuffer growth: enforce per-server or global cap
+        int maxAllowed = GLOBAL_MAX_REQUEST_BUFFER;
+        if (connectionState.endpoint != null && connectionState.endpoint.serverConfig != null && connectionState.endpoint.serverConfig.client_body_limit > 0) {
+            long cfg = connectionState.endpoint.serverConfig.client_body_limit;
+            if (cfg < maxAllowed) {
+                maxAllowed = (int) Math.max(0, Math.min(cfg, Integer.MAX_VALUE));
+            }
+        }
+        if (connectionState.requestBuffer.size() > maxAllowed) {
+            closeKey(key);
+            return;
+        }
 
         HttpRequestParser.ParsedRequest parsedRequest = tryParseRequest(connectionState.requestBuffer.toByteArray());
         if (parsedRequest == null) {
@@ -170,6 +192,7 @@ public class Server {
 
         ServerConfig serverConfig = selectServerForRequest(connectionState.endpoint, parsedRequest);
         connectionState.responseBuffer = ByteBuffer.wrap(buildResponse(serverConfig, parsedRequest).getBytes(StandardCharsets.UTF_8));
+        connectionState.requestStartMillis = -1;
         key.interestOps(SelectionKey.OP_WRITE);
     }
 
@@ -185,7 +208,11 @@ public class Server {
     }
 
     private HttpRequestParser.ParsedRequest tryParseRequest(byte[] requestBytes) {
-        return HttpRequestParser.parseRequest(requestBytes);
+        try {
+            return HttpRequestParser.parseRequest(requestBytes);
+        } catch (Exception e) {
+            return HttpRequestParser.ParsedRequest.invalid();
+        }
     }
 
     private ServerConfig selectServerForRequest(Endpoint endpoint, HttpRequestParser.ParsedRequest parsedRequest) {
@@ -290,12 +317,43 @@ public class Server {
     }
 
     private String saveUpload(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
-        Path target = resolveWritablePath(route, parsedRequest, "upload.bin");
-        if (target == null) {
-            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
+        String contentType = parsedRequest.headers.getOrDefault("content-type", "");
+        long limit = route != null && route.client_body_limit != null
+                ? route.client_body_limit
+                : serverConfig != null && serverConfig.client_body_limit > 0 ? serverConfig.client_body_limit : Long.MAX_VALUE;
+
+        int actualSize = parsedRequest.body == null ? 0 : parsedRequest.body.getBytes(StandardCharsets.ISO_8859_1).length;
+        if (actualSize > limit) {
+            return error.build(serverConfig, parsedRequest, 413, "Request Entity Too Large");
         }
 
         try {
+            if (contentType != null && contentType.toLowerCase(Locale.ROOT).startsWith("multipart/form-data")) {
+                String boundary = extractBoundary(contentType);
+                if (boundary == null || boundary.isBlank()) {
+                    return error.build(serverConfig, parsedRequest, 400, "Bad Request");
+                }
+                try {
+                    List<Path> saved = parseMultipartAndSave(route, parsedRequest, boundary, limit);
+                    if (saved.isEmpty()) {
+                        return error.build(serverConfig, parsedRequest, 400, "Bad Request");
+                    }
+                    StringBuilder bodyBuilder = new StringBuilder();
+                    for (Path p : saved) {
+                        if (bodyBuilder.length() > 0) bodyBuilder.append("\n");
+                        bodyBuilder.append("Uploaded ").append(p.getFileName());
+                    }
+                    return HttpResponseBuilder.buildResponse(parsedRequest, 201, "Created", bodyBuilder.toString(), "text/plain; charset=utf-8");
+                } catch (BodyTooLargeException btle) {
+                    return error.build(serverConfig, parsedRequest, 413, "Request Entity Too Large");
+                }
+            }
+
+            // Fallback: write raw body to a single file
+            Path target = resolveWritablePath(route, parsedRequest, "upload.bin");
+            if (target == null) {
+                return error.build(serverConfig, parsedRequest, 403, "Forbidden");
+            }
             Files.createDirectories(target.getParent());
             Files.write(target, parsedRequest.body.getBytes(StandardCharsets.ISO_8859_1));
             String body = "Uploaded " + target.getFileName();
@@ -303,6 +361,152 @@ public class Server {
         } catch (IOException exception) {
             return error.build(serverConfig, parsedRequest, 500, "Internal Server Error");
         }
+    }
+
+    private String extractBoundary(String contentType) {
+        String[] parts = contentType.split(";");
+        for (String p : parts) {
+            String trimmed = p.trim();
+            if (trimmed.toLowerCase(Locale.ROOT).startsWith("boundary=")) {
+                String[] kv = trimmed.split("=", 2);
+                if (kv.length == 2) {
+                    String b = kv[1];
+                    if (b.startsWith("\"") && b.endsWith("\"")) {
+                        b = b.substring(1, b.length() - 1);
+                    }
+                    return b;
+                }
+            }
+        }
+        return null;
+    }
+
+    private List<Path> parseMultipartAndSave(Route route, HttpRequestParser.ParsedRequest parsedRequest, String boundary, long limit) throws IOException, BodyTooLargeException {
+        List<Path> saved = new ArrayList<>();
+        String body = parsedRequest.body;
+        String sep = "--" + boundary;
+        String[] sections = body.split(Pattern.quote(sep));
+        String requestedFilename = extractQueryParam(parsedRequest.query, "filename");
+        boolean useRequested = requestedFilename != null && !requestedFilename.isBlank();
+        long totalWritten = 0L;
+        for (String section : sections) {
+            if (section == null) continue;
+            section = section.trim();
+            if (section.isEmpty() || section.equals("--")) continue;
+
+            // split headers and part body
+            int headerEnd = section.indexOf("\r\n\r\n");
+            int headerSepLen = 4;
+            if (headerEnd == -1) {
+                headerEnd = section.indexOf("\n\n");
+                headerSepLen = 2;
+            }
+            if (headerEnd == -1) continue;
+
+            String headerSection = section.substring(0, headerEnd);
+            String partBody = section.substring(headerEnd + headerSepLen);
+
+            // remove possible trailing boundary markers
+            if (partBody.endsWith("--")) {
+                partBody = partBody.substring(0, partBody.length() - 2);
+            }
+
+            String filename = null;
+            String[] headerLines = headerSection.split("\r?\n");
+            for (String hl : headerLines) {
+                int idx = hl.indexOf(":");
+                if (idx <= 0) continue;
+                String name = hl.substring(0, idx).trim().toLowerCase(Locale.ROOT);
+                String value = hl.substring(idx + 1).trim();
+                if ("content-disposition".equals(name)) {
+                    // look for filename="..."
+                    String[] partsDisp = value.split(";");
+                    for (String pd : partsDisp) {
+                        pd = pd.trim();
+                        if (pd.toLowerCase(Locale.ROOT).startsWith("filename=")) {
+                            String[] kv = pd.split("=", 2);
+                            if (kv.length == 2) {
+                                filename = kv[1].trim();
+                                if (filename.startsWith("\"") && filename.endsWith("\"")) {
+                                    filename = filename.substring(1, filename.length() - 1);
+                                }
+                                // some browsers include full path, keep only basename
+                                int lastSep = Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\'));
+                                if (lastSep >= 0) filename = filename.substring(lastSep + 1);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (filename == null || filename.isBlank()) {
+                // no file in this part; skip
+                continue;
+            }
+
+            String finalName = filename;
+            if (useRequested) {
+                finalName = requestedFilename;
+            }
+
+            Path target = resolveWritablePath(route, parsedRequest, finalName);
+            if (target == null) {
+                continue;
+            }
+            Files.createDirectories(target.getParent());
+
+            // ensure unique filename to avoid overwriting
+            byte[] partBytes = partBody.getBytes(StandardCharsets.ISO_8859_1);
+            if (totalWritten + partBytes.length > limit) {
+                throw new BodyTooLargeException();
+            }
+            Path unique = makeUnique(target);
+            Files.write(unique, partBytes);
+            saved.add(unique);
+            totalWritten += partBytes.length;
+        }
+        return saved;
+    }
+
+    private String extractQueryParam(String query, String key) {
+        if (query == null || query.isBlank() || key == null) return null;
+        String[] pairs = query.split("&");
+        for (String p : pairs) {
+            int idx = p.indexOf('=');
+            String k = idx >= 0 ? p.substring(0, idx) : p;
+            String v = idx >= 0 ? p.substring(idx + 1) : "";
+            if (k.equals(key)) {
+                try {
+                    return URLDecoder.decode(v, StandardCharsets.UTF_8.name());
+                } catch (Exception e) {
+                    return v;
+                }
+            }
+        }
+        return null;
+    }
+
+    private Path makeUnique(Path target) {
+        if (!Files.exists(target)) return target;
+        String base = target.getFileName().toString();
+        String name = base;
+        String ext = "";
+        int dot = base.lastIndexOf('.');
+        if (dot >= 0) {
+            name = base.substring(0, dot);
+            ext = base.substring(dot);
+        }
+        int i = 1;
+        Path parent = target.getParent();
+        while (true) {
+            Path candidate = parent.resolve(name + "-" + i + ext);
+            if (!Files.exists(candidate)) return candidate;
+            i++;
+        }
+    }
+
+    private static final class BodyTooLargeException extends Exception {
+        private static final long serialVersionUID = 1L;
     }
 
     private String deleteResource(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
@@ -419,11 +623,13 @@ public class Server {
         try {
             StringBuilder builder = new StringBuilder();
             builder.append("<html><body><h1>Directory listing</h1><ul>");
-            for (Path entry : Files.list(directoryPath).sorted().toList()) {
-                String entryName = entry.getFileName().toString();
-                builder.append("<li><a href=\"").append(entryName).append("\">")
-                        .append(entryName)
-                        .append("</a></li>");
+            try (var stream = Files.list(directoryPath)) {
+                for (Path entry : stream.sorted().toList()) {
+                    String entryName = entry.getFileName().toString();
+                    builder.append("<li><a href=\"").append(entryName).append("\">")
+                            .append(entryName)
+                            .append("</a></li>");
+                }
             }
             builder.append("</ul></body></html>");
             return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", builder.toString(), "text/html; charset=utf-8");
@@ -474,14 +680,26 @@ public class Server {
 
     private void closeIdleConnections(Selector selector) {
         long now = System.currentTimeMillis();
+        // periodically cleanup expired sessions to free memory
+        try {
+            SessionManager.INSTANCE.cleanupExpired();
+        } catch (Exception ignored) {
+        }
         for (SelectionKey key : selector.keys()) {
             if (!key.isValid() || !(key.channel() instanceof SocketChannel)) {
                 continue;
             }
 
             ConnectionState connectionState = (ConnectionState) key.attachment();
-            if (connectionState != null && now - connectionState.lastActivityMillis > IDLE_TIMEOUT_MILLIS) {
-                closeKey(key);
+            if (connectionState != null) {
+                if (now - connectionState.lastActivityMillis > IDLE_TIMEOUT_MILLIS) {
+                    closeKey(key);
+                    continue;
+                }
+                if (connectionState.requestStartMillis > 0 && now - connectionState.requestStartMillis > REQUEST_TIMEOUT_MILLIS) {
+                    closeKey(key);
+                    continue;
+                }
             }
         }
     }
@@ -511,6 +729,7 @@ public class Server {
         final ByteArrayOutputStream requestBuffer;
         ByteBuffer responseBuffer;
         long lastActivityMillis;
+        long requestStartMillis = -1;
 
         ConnectionState(Endpoint endpoint) {
             this.endpoint = endpoint;
