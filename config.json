@@ -8,11 +8,11 @@
         "400": "error_pages/400.html",
         "403": "error_pages/403.html",
         "404": "error_pages/404.html",
-        "405": "error_pages/405.html",
+        "405": "error_pages/4005.html",
         "413": "error_pages/413.html",
         "500": "error_pages/500.html"
       },
-      "client_body_limit": 1048576,
+      "client_body_limit": 11737418240,
       "routes": [
         {
           "path": "/",
@@ -25,7 +25,7 @@
           "path": "/upload",
           "root": "uploads",
           "methods": ["GET", "POST", "DELETE"],
-          "client_body_limit": 21474836480
+          "client_body_limit": 11737418240
         },
         {
 
@@ -50,7 +50,7 @@
       ]
     },{
       "host": "127.0.0.1",
-      "ports": [8080,8081],
+      "ports": [8082,8081],
       "server_name": "jjjjj",
       "error_pages": {
         "400": "error_pages/400.html",
@@ -73,7 +73,7 @@
           "path": "/upload",
           "root": "uploads",
           "methods": ["GET", "POST", "DELETE"],
-          "client_body_limit": 21474836480
+          "client_body_limit": 21474836480000
         },
         {
           "path": "/cgi",
