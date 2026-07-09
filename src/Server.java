@@ -1,5 +1,6 @@
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
@@ -11,15 +12,17 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.regex.Pattern;
 import java.net.URLDecoder;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class Server {
     private static final int READ_BUFFER_SIZE = 8192;
+    private static final int MEMORY_REQUEST_LIMIT = 64 * 1024;
     private static final long IDLE_TIMEOUT_MILLIS = 30_000L;
     private static final long REQUEST_TIMEOUT_MILLIS = 60_000L;
     private static final int GLOBAL_MAX_REQUEST_BUFFER = 10 * 1024 * 1024; // 10 MB
@@ -57,7 +60,7 @@ public class Server {
 
                 String endpointKey = host + ":" + port;
                 if (!boundEndpoints.add(endpointKey)) {
-                    continue;
+                    throw new IOException("Duplicate endpoint configured: " + endpointKey);
                 }
 
                 bindServerPort(selector, host, port, serverConfig);
@@ -166,33 +169,18 @@ public class Server {
         buffer.flip();
         byte[] chunk = new byte[buffer.remaining()];
         buffer.get(chunk);
-        boolean wasEmpty = connectionState.requestBuffer.size() == 0;
-        connectionState.requestBuffer.write(chunk);
-        if (wasEmpty) {
+        if (connectionState.requestStartMillis < 0) {
             connectionState.requestStartMillis = System.currentTimeMillis();
         }
+        connectionState.append(chunk);
 
-        // Prevent unbounded requestBuffer growth: enforce per-server or global cap
-        int maxAllowed = GLOBAL_MAX_REQUEST_BUFFER;
-        if (connectionState.endpoint != null && connectionState.endpoint.serverConfig != null && connectionState.endpoint.serverConfig.client_body_limit > 0) {
-            long cfg = connectionState.endpoint.serverConfig.client_body_limit;
-            if (cfg < maxAllowed) {
-                maxAllowed = (int) Math.max(0, Math.min(cfg, Integer.MAX_VALUE));
-            }
-        }
-        if (connectionState.requestBuffer.size() > maxAllowed) {
-            closeKey(key);
-            return;
-        }
-
-        HttpRequestParser.ParsedRequest parsedRequest = tryParseRequest(connectionState.requestBuffer.toByteArray());
+        HttpRequestParser.ParsedRequest parsedRequest = tryParseRequest(connectionState.requestBytes());
         if (parsedRequest == null) {
             return;
         }
 
         ServerConfig serverConfig = selectServerForRequest(connectionState.endpoint, parsedRequest);
-        connectionState.responseBuffer = ByteBuffer.wrap(buildResponse(serverConfig, parsedRequest).getBytes(StandardCharsets.UTF_8));
-        connectionState.requestStartMillis = -1;
+        connectionState.responseBuffer = ByteBuffer.wrap(buildResponseBytes(serverConfig, parsedRequest));
         key.interestOps(SelectionKey.OP_WRITE);
     }
 
@@ -242,6 +230,19 @@ public class Server {
             }
         }
         return false;
+    }
+
+    private byte[] buildResponseBytes(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest) {
+        if (parsedRequest.valid && "GET".equals(parsedRequest.method)) {
+            Router.RouteMatch routeMatch = Router.matchRoute(serverConfig, parsedRequest);
+            if (routeMatch != null && routeMatch.statusCode == 200 && (routeMatch.route.cgi_extensions == null || routeMatch.route.cgi_extensions.isEmpty())) {
+                byte[] staticResponse = serveStaticFileBytes(serverConfig, routeMatch.route, parsedRequest);
+                if (staticResponse != null) {
+                    return staticResponse;
+                }
+            }
+        }
+        return buildResponse(serverConfig, parsedRequest).getBytes(StandardCharsets.UTF_8);
     }
 
     String buildResponse(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest) {
@@ -317,43 +318,16 @@ public class Server {
     }
 
     private String saveUpload(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
-        String contentType = parsedRequest.headers.getOrDefault("content-type", "");
-        long limit = route != null && route.client_body_limit != null
-                ? route.client_body_limit
-                : serverConfig != null && serverConfig.client_body_limit > 0 ? serverConfig.client_body_limit : Long.MAX_VALUE;
+        if (isMultipart(parsedRequest)) {
+            return saveMultipartUpload(serverConfig, route, parsedRequest);
+        }
 
-        int actualSize = parsedRequest.body == null ? 0 : parsedRequest.body.getBytes(StandardCharsets.ISO_8859_1).length;
-        if (actualSize > limit) {
-            return error.build(serverConfig, parsedRequest, 413, "Request Entity Too Large");
+        Path target = resolveWritablePath(route, parsedRequest, "upload.bin");
+        if (target == null) {
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
         }
 
         try {
-            if (contentType != null && contentType.toLowerCase(Locale.ROOT).startsWith("multipart/form-data")) {
-                String boundary = extractBoundary(contentType);
-                if (boundary == null || boundary.isBlank()) {
-                    return error.build(serverConfig, parsedRequest, 400, "Bad Request");
-                }
-                try {
-                    List<Path> saved = parseMultipartAndSave(route, parsedRequest, boundary, limit);
-                    if (saved.isEmpty()) {
-                        return error.build(serverConfig, parsedRequest, 400, "Bad Request");
-                    }
-                    StringBuilder bodyBuilder = new StringBuilder();
-                    for (Path p : saved) {
-                        if (bodyBuilder.length() > 0) bodyBuilder.append("\n");
-                        bodyBuilder.append("Uploaded ").append(p.getFileName());
-                    }
-                    return HttpResponseBuilder.buildResponse(parsedRequest, 201, "Created", bodyBuilder.toString(), "text/plain; charset=utf-8");
-                } catch (BodyTooLargeException btle) {
-                    return error.build(serverConfig, parsedRequest, 413, "Request Entity Too Large");
-                }
-            }
-
-            // Fallback: write raw body to a single file
-            Path target = resolveWritablePath(route, parsedRequest, "upload.bin");
-            if (target == null) {
-                return error.build(serverConfig, parsedRequest, 403, "Forbidden");
-            }
             Files.createDirectories(target.getParent());
             Files.write(target, parsedRequest.body.getBytes(StandardCharsets.ISO_8859_1));
             String body = "Uploaded " + target.getFileName();
@@ -363,150 +337,76 @@ public class Server {
         }
     }
 
-    private String extractBoundary(String contentType) {
-        String[] parts = contentType.split(";");
-        for (String p : parts) {
-            String trimmed = p.trim();
-            if (trimmed.toLowerCase(Locale.ROOT).startsWith("boundary=")) {
-                String[] kv = trimmed.split("=", 2);
-                if (kv.length == 2) {
-                    String b = kv[1];
-                    if (b.startsWith("\"") && b.endsWith("\"")) {
-                        b = b.substring(1, b.length() - 1);
-                    }
-                    return b;
+    private boolean isMultipart(HttpRequestParser.ParsedRequest parsedRequest) {
+        String contentType = parsedRequest.headers.getOrDefault("content-type", "");
+        return contentType.toLowerCase(Locale.ROOT).startsWith("multipart/form-data");
+    }
+
+    private String saveMultipartUpload(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
+        String boundary = multipartBoundary(parsedRequest.headers.get("content-type"));
+        Path uploadRoot = resolveWritablePath(route, parsedRequest, "");
+        if (boundary == null || uploadRoot == null) {
+            return error.build(serverConfig, parsedRequest, 400, "Bad Request");
+        }
+
+        try {
+            Files.createDirectories(uploadRoot);
+            int savedFiles = 0;
+            String marker = "--" + boundary;
+            for (String part : parsedRequest.body.split(Pattern.quote(marker))) {
+                if (part.isBlank() || part.startsWith("--")) {
+                    continue;
                 }
+
+                int split = part.indexOf("\r\n\r\n");
+                int separatorLength = 4;
+                if (split < 0) {
+                    split = part.indexOf("\n\n");
+                    separatorLength = 2;
+                }
+                if (split < 0) {
+                    continue;
+                }
+
+                String headers = part.substring(0, split);
+                String fileName = multipartFileName(headers);
+                if (fileName == null || fileName.isBlank()) {
+                    continue;
+                }
+
+                String body = part.substring(split + separatorLength);
+                body = body.replaceFirst("\\r?\\n$", "");
+                Path target = uploadRoot.resolve(Path.of(fileName).getFileName()).normalize();
+                if (!isPathWithinRoot(uploadRoot, target)) {
+                    continue;
+                }
+                Files.write(target, body.getBytes(StandardCharsets.ISO_8859_1));
+                savedFiles++;
+            }
+
+            return HttpResponseBuilder.buildResponse(parsedRequest, 201, "Created",
+                    "Uploaded " + savedFiles + " file(s)", "text/plain; charset=utf-8");
+        } catch (IOException exception) {
+            return error.build(serverConfig, parsedRequest, 500, "Internal Server Error");
+        }
+    }
+
+    private String multipartBoundary(String contentType) {
+        if (contentType == null) {
+            return null;
+        }
+        for (String part : contentType.split(";")) {
+            String trimmed = part.trim();
+            if (trimmed.startsWith("boundary=")) {
+                return trimmed.substring("boundary=".length()).replace("\"", "");
             }
         }
         return null;
     }
 
-    private List<Path> parseMultipartAndSave(Route route, HttpRequestParser.ParsedRequest parsedRequest, String boundary, long limit) throws IOException, BodyTooLargeException {
-        List<Path> saved = new ArrayList<>();
-        String body = parsedRequest.body;
-        String sep = "--" + boundary;
-        String[] sections = body.split(Pattern.quote(sep));
-        String requestedFilename = extractQueryParam(parsedRequest.query, "filename");
-        boolean useRequested = requestedFilename != null && !requestedFilename.isBlank();
-        long totalWritten = 0L;
-        for (String section : sections) {
-            if (section == null) continue;
-            section = section.trim();
-            if (section.isEmpty() || section.equals("--")) continue;
-
-            // split headers and part body
-            int headerEnd = section.indexOf("\r\n\r\n");
-            int headerSepLen = 4;
-            if (headerEnd == -1) {
-                headerEnd = section.indexOf("\n\n");
-                headerSepLen = 2;
-            }
-            if (headerEnd == -1) continue;
-
-            String headerSection = section.substring(0, headerEnd);
-            String partBody = section.substring(headerEnd + headerSepLen);
-
-            // remove possible trailing boundary markers
-            if (partBody.endsWith("--")) {
-                partBody = partBody.substring(0, partBody.length() - 2);
-            }
-
-            String filename = null;
-            String[] headerLines = headerSection.split("\r?\n");
-            for (String hl : headerLines) {
-                int idx = hl.indexOf(":");
-                if (idx <= 0) continue;
-                String name = hl.substring(0, idx).trim().toLowerCase(Locale.ROOT);
-                String value = hl.substring(idx + 1).trim();
-                if ("content-disposition".equals(name)) {
-                    // look for filename="..."
-                    String[] partsDisp = value.split(";");
-                    for (String pd : partsDisp) {
-                        pd = pd.trim();
-                        if (pd.toLowerCase(Locale.ROOT).startsWith("filename=")) {
-                            String[] kv = pd.split("=", 2);
-                            if (kv.length == 2) {
-                                filename = kv[1].trim();
-                                if (filename.startsWith("\"") && filename.endsWith("\"")) {
-                                    filename = filename.substring(1, filename.length() - 1);
-                                }
-                                // some browsers include full path, keep only basename
-                                int lastSep = Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\'));
-                                if (lastSep >= 0) filename = filename.substring(lastSep + 1);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (filename == null || filename.isBlank()) {
-                // no file in this part; skip
-                continue;
-            }
-
-            String finalName = filename;
-            if (useRequested) {
-                finalName = requestedFilename;
-            }
-
-            Path target = resolveWritablePath(route, parsedRequest, finalName);
-            if (target == null) {
-                continue;
-            }
-            Files.createDirectories(target.getParent());
-
-            // ensure unique filename to avoid overwriting
-            byte[] partBytes = partBody.getBytes(StandardCharsets.ISO_8859_1);
-            if (totalWritten + partBytes.length > limit) {
-                throw new BodyTooLargeException();
-            }
-            Path unique = makeUnique(target);
-            Files.write(unique, partBytes);
-            saved.add(unique);
-            totalWritten += partBytes.length;
-        }
-        return saved;
-    }
-
-    private String extractQueryParam(String query, String key) {
-        if (query == null || query.isBlank() || key == null) return null;
-        String[] pairs = query.split("&");
-        for (String p : pairs) {
-            int idx = p.indexOf('=');
-            String k = idx >= 0 ? p.substring(0, idx) : p;
-            String v = idx >= 0 ? p.substring(idx + 1) : "";
-            if (k.equals(key)) {
-                try {
-                    return URLDecoder.decode(v, StandardCharsets.UTF_8.name());
-                } catch (Exception e) {
-                    return v;
-                }
-            }
-        }
-        return null;
-    }
-
-    private Path makeUnique(Path target) {
-        if (!Files.exists(target)) return target;
-        String base = target.getFileName().toString();
-        String name = base;
-        String ext = "";
-        int dot = base.lastIndexOf('.');
-        if (dot >= 0) {
-            name = base.substring(0, dot);
-            ext = base.substring(dot);
-        }
-        int i = 1;
-        Path parent = target.getParent();
-        while (true) {
-            Path candidate = parent.resolve(name + "-" + i + ext);
-            if (!Files.exists(candidate)) return candidate;
-            i++;
-        }
-    }
-
-    private static final class BodyTooLargeException extends Exception {
-        private static final long serialVersionUID = 1L;
+    private String multipartFileName(String headers) {
+        Matcher matcher = Pattern.compile("filename=\"([^\"]+)\"").matcher(headers);
+        return matcher.find() ? matcher.group(1) : null;
     }
 
     private String deleteResource(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
@@ -551,45 +451,50 @@ public class Server {
     }
 
     private String serveStaticFile(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
+        byte[] responseBytes = serveStaticFileBytes(serverConfig, route, parsedRequest);
+        return responseBytes == null ? null : new String(responseBytes, StandardCharsets.ISO_8859_1);
+    }
+
+    private byte[] serveStaticFileBytes(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
         if (route == null || route.root == null || route.root.isBlank()) {
             return null;
         }
 
         Path rootPath = Path.of(route.root).toAbsolutePath().normalize();
         if (!Files.exists(rootPath)) {
-            return error.build(serverConfig, parsedRequest, 404, "Not Found");
+            return error.build(serverConfig, parsedRequest, 404, "Not Found").getBytes(StandardCharsets.UTF_8);
         }
 
         Path requestedPath = resolveRequestedPath(route, parsedRequest.path);
         if (requestedPath == null) {
-            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden").getBytes(StandardCharsets.UTF_8);
         }
 
         Path resolvedPath = rootPath.resolve(requestedPath).normalize();
         if (!isPathWithinRoot(rootPath, resolvedPath)) {
-            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden").getBytes(StandardCharsets.UTF_8);
         }
 
         if (Files.isDirectory(resolvedPath)) {
             if (route.default_file != null && !route.default_file.isBlank()) {
                 Path defaultFile = resolvedPath.resolve(route.default_file).normalize();
                 if (Files.isRegularFile(defaultFile) && isPathWithinRoot(rootPath, defaultFile)) {
-                    return serveFile(serverConfig, parsedRequest, defaultFile);
+                    return serveFileBytes(serverConfig, parsedRequest, defaultFile);
                 }
             }
 
             if (Boolean.TRUE.equals(route.directory_listing)) {
-                return buildDirectoryListing(serverConfig, parsedRequest, resolvedPath);
+                return buildDirectoryListing(serverConfig, parsedRequest, resolvedPath).getBytes(StandardCharsets.UTF_8);
             }
             
-            return error.build(serverConfig, parsedRequest, 403, "Forbidden");
+            return error.build(serverConfig, parsedRequest, 403, "Forbidden").getBytes(StandardCharsets.UTF_8);
         }
 
         if (!Files.isRegularFile(resolvedPath)) {
-            return error.build(serverConfig, parsedRequest, 404, "Not Found");
+            return error.build(serverConfig, parsedRequest, 404, "Not Found").getBytes(StandardCharsets.UTF_8);
         }
 
-        return serveFile(serverConfig, parsedRequest, resolvedPath);
+        return serveFileBytes(serverConfig, parsedRequest, resolvedPath);
     }
 
     private Path resolveRequestedPath(Route route, String requestPath) {
@@ -610,12 +515,16 @@ public class Server {
     }
 
     private String serveFile(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest, Path filePath) {
+        return new String(serveFileBytes(serverConfig, parsedRequest, filePath), StandardCharsets.ISO_8859_1);
+    }
+
+    private byte[] serveFileBytes(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest, Path filePath) {
         try {
-            String content = Files.readString(filePath, StandardCharsets.UTF_8);
+            byte[] content = Files.readAllBytes(filePath);
             String contentType = determineContentType(filePath);
-            return HttpResponseBuilder.buildResponse(parsedRequest, 200, "OK", content, contentType);
+            return HttpResponseBuilder.buildBinaryResponse(parsedRequest, 200, "OK", content, contentType);
         } catch (IOException exception) {
-            return error.build(serverConfig, parsedRequest, 404, "Not Found");
+            return error.build(serverConfig, parsedRequest, 404, "Not Found").getBytes(StandardCharsets.UTF_8);
         }
     }
 
@@ -626,8 +535,10 @@ public class Server {
             try (var stream = Files.list(directoryPath)) {
                 for (Path entry : stream.sorted().toList()) {
                     String entryName = entry.getFileName().toString();
-                    builder.append("<li><a href=\"").append(entryName).append("\">")
-                            .append(entryName)
+                    String escapedName = escapeHtml(entryName);
+                    String escapedHref = escapeHtmlAttribute(entryName);
+                    builder.append("<li><a href=\"").append(escapedHref).append("\">")
+                            .append(escapedName)
                             .append("</a></li>");
                 }
             }
@@ -636,6 +547,21 @@ public class Server {
         } catch (IOException exception) {
             return error.build(serverConfig, parsedRequest, 500, "Internal Server Error");
         }
+    }
+
+    private String escapeHtml(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&#39;");
+    }
+
+    private String escapeHtmlAttribute(String value) {
+        return escapeHtml(value);
     }
 
     private boolean isPathWithinRoot(Path rootPath, Path resolvedPath) {
@@ -656,6 +582,18 @@ public class Server {
         }
         if (fileName.endsWith(".json")) {
             return "application/json; charset=utf-8";
+        }
+        if (fileName.endsWith(".png")) {
+            return "image/png";
+        }
+        if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg")) {
+            return "image/jpeg";
+        }
+        if (fileName.endsWith(".gif")) {
+            return "image/gif";
+        }
+        if (fileName.endsWith(".webp")) {
+            return "image/webp";
         }
         return "application/octet-stream";
     }
@@ -705,6 +643,10 @@ public class Server {
     }
 
     private void closeKey(SelectionKey key) {
+        Object attachment = key.attachment();
+        if (attachment instanceof ConnectionState) {
+            ((ConnectionState) attachment).cleanup();
+        }
         try {
             key.channel().close();
         } catch (IOException ignored) {
@@ -727,6 +669,8 @@ public class Server {
     private static final class ConnectionState {
         final Endpoint endpoint;
         final ByteArrayOutputStream requestBuffer;
+        Path tempRequestFile;
+        OutputStream tempRequestStream;
         ByteBuffer responseBuffer;
         long lastActivityMillis;
         long requestStartMillis = -1;
@@ -735,6 +679,48 @@ public class Server {
             this.endpoint = endpoint;
             this.requestBuffer = new ByteArrayOutputStream();
             this.lastActivityMillis = System.currentTimeMillis();
+        }
+
+        void append(byte[] chunk) throws IOException {
+            if (tempRequestStream != null) {
+                tempRequestStream.write(chunk);
+                return;
+            }
+
+            if (requestBuffer.size() + chunk.length <= MEMORY_REQUEST_LIMIT) {
+                requestBuffer.write(chunk);
+                return;
+            }
+
+            tempRequestFile = Files.createTempFile("java-server-request-", ".tmp");
+            tempRequestStream = Files.newOutputStream(tempRequestFile);
+            requestBuffer.writeTo(tempRequestStream);
+            requestBuffer.reset();
+            tempRequestStream.write(chunk);
+        }
+
+        byte[] requestBytes() throws IOException {
+            if (tempRequestStream == null) {
+                return requestBuffer.toByteArray();
+            }
+
+            tempRequestStream.flush();
+            return Files.readAllBytes(tempRequestFile);
+        }
+
+        void cleanup() {
+            try {
+                if (tempRequestStream != null) {
+                    tempRequestStream.close();
+                }
+            } catch (IOException ignored) {
+            }
+            try {
+                if (tempRequestFile != null) {
+                    Files.deleteIfExists(tempRequestFile);
+                }
+            } catch (IOException ignored) {
+            }
         }
     }
 

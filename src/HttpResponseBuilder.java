@@ -37,6 +37,26 @@ public class HttpResponseBuilder {
         return buildResponse(parsedRequest, statusCode, reasonPhrase, body, "text/plain; charset=utf-8");
     }
 
+    public static byte[] buildBinaryResponse(HttpRequestParser.ParsedRequest parsedRequest, int statusCode,
+                                             String reasonPhrase, byte[] bodyBytes, String contentType) {
+        String responseVersion = responseVersion(parsedRequest);
+        StringBuilder responseBuilder = new StringBuilder();
+        responseBuilder.append(responseVersion).append(' ').append(statusCode).append(' ').append(reasonPhrase).append("\r\n");
+        responseBuilder.append("Content-Type: ").append(contentType).append("\r\n");
+        responseBuilder.append("Content-Length: ").append(bodyBytes.length).append("\r\n");
+        responseBuilder.append("Connection: close\r\n");
+        for (Map.Entry<String, String> header : responseHeaders(parsedRequest, Map.of()).entrySet()) {
+            responseBuilder.append(header.getKey()).append(": ").append(header.getValue()).append("\r\n");
+        }
+        responseBuilder.append("\r\n");
+
+        byte[] headerBytes = responseBuilder.toString().getBytes(StandardCharsets.UTF_8);
+        byte[] responseBytes = new byte[headerBytes.length + bodyBytes.length];
+        System.arraycopy(headerBytes, 0, responseBytes, 0, headerBytes.length);
+        System.arraycopy(bodyBytes, 0, responseBytes, headerBytes.length, bodyBytes.length);
+        return responseBytes;
+    }
+
     public static String buildRedirectResponse(HttpRequestParser.ParsedRequest parsedRequest, String location) {
         String body = "Redirecting to " + location;
         byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
