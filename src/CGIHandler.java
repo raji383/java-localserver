@@ -52,9 +52,7 @@ public class CGIHandler {
         }
     }
 
-    // Sanitize values placed into environment variables for CGI scripts.
-    // Removes NUL, CR, LF and other control characters, and truncates to a sane
-    // length.
+
     private static String sanitizeEnv(String v) {
         if (v == null)
             return "";
@@ -64,7 +62,7 @@ public class CGIHandler {
             if (c == '\u0000' || c == '\r' || c == '\n')
                 continue;
             if (c < 0x20 && c != '\t')
-                continue; // drop other control chars except tab
+                continue;
             if (c == 0x7f)
                 continue;
             sb.append(c);
