@@ -37,7 +37,7 @@
         },
         {
           "path": "/cgi",
-          "root": "cgi",
+          "root": "ussra",
           "methods": ["GET","POST","DELETE"],
           "cgi_extensions": [".py"],
           "client_body_limit": 21474836480

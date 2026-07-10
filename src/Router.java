@@ -23,12 +23,11 @@ public class Router {
             }
 
             int routeScore = routeScore(requestPath, route.path);
-            if (routeScore <= bestScore) {
-                continue;
+            if (routeScore > bestScore) {
+                bestRoute = route;
+                bestScore = routeScore;
             }
 
-            bestRoute = route;
-            bestScore = routeScore;
         }
 
         if (bestRoute == null) {

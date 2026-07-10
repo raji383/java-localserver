@@ -11,8 +11,6 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.net.URLDecoder;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -28,7 +26,7 @@ public class Server {
     private static final int MEMORY_REQUEST_LIMIT = 64 * 1024;
     private static final long IDLE_TIMEOUT_MILLIS = 30_000L;
     private static final long REQUEST_TIMEOUT_MILLIS = 60_000L;
-    private static final int GLOBAL_MAX_REQUEST_BUFFER = 10 * 1024 * 1024; // 10 MB
+    // private static final int GLOBAL_MAX_REQUEST_BUFFER = 10 * 1024 * 1024; // 10 MB
 
     private final List<ServerConfig> serverConfigs;
     private final ExecutorService cgiExecutor = Executors.newCachedThreadPool();
@@ -56,7 +54,7 @@ public class Server {
                 continue;
             }
 
-            String host = normalizeHost(serverConfig.host);
+            String host = serverConfig.host == null || serverConfig.host.isBlank() ? "0.0.0.0" : serverConfig.host;
             for (Integer port : serverConfig.ports) {
                 if (port == null) {
                     continue;
@@ -87,7 +85,7 @@ public class Server {
             host = "0.0.0.0";
         }
 
-        String normalizedHost = normalizeHost(host);
+        String normalizedHost = host == null || host.isBlank() ? "0.0.0.0" : host;
         for (ServerConfig serverConfig : serverConfigs) {
             if (serverConfig == null || serverConfig.ports == null || serverConfig.ports.isEmpty()) {
                 continue;
@@ -103,7 +101,7 @@ public class Server {
         if (serverConfig == null || serverConfig.ports == null || serverConfig.ports.isEmpty()) {
             return false;
         }
-        String normalizedHost = normalizeHost(serverConfig.host);
+        String normalizedHost = host == null || host.isBlank() ? "0.0.0.0" : host;
         if (!normalizedHost.equals("0.0.0.0") && !normalizedHost.equals(host)) {
             return false;
         }
@@ -113,10 +111,6 @@ public class Server {
             }
         }
         return false;
-    }
-
-    private String normalizeHost(String host) {
-        return host == null || host.isBlank() ? "0.0.0.0" : host;
     }
 
     private void processSelectedKeys(Selector selector) {
@@ -178,12 +172,10 @@ public class Server {
         }
 
         if (connectionState.streamingUpload) {
-            continueStreamingUpload(key, connectionState, chunk);
+            writeStreamingUploadBytes(key, connectionState, chunk, 0, chunk.length);
             return;
         }
-
         connectionState.append(chunk);
-
         if (tryStartStreamingUpload(key, connectionState)) {
             return;
         }
@@ -322,10 +314,6 @@ public class Server {
         connectionState.continueSent = true;
     }
 
-    private void continueStreamingUpload(SelectionKey key, ConnectionState connectionState, byte[] chunk) throws IOException {
-        writeStreamingUploadBytes(key, connectionState, chunk, 0, chunk.length);
-    }
-
     private void writeStreamingUploadBytes(SelectionKey key, ConnectionState connectionState, byte[] bytes, int offset, int length) throws IOException {
         long bytesToWrite = Math.min(connectionState.uploadRemainingBytes, length);
         if (bytesToWrite > 0) {
@@ -349,12 +337,12 @@ public class Server {
         String requestText = new String(requestBytes, StandardCharsets.ISO_8859_1);
         int headerEndIndex = requestText.indexOf("\r\n\r\n");
         int separatorLength = 4;
-        if (headerEndIndex < 0) {
+        if (headerEndIndex < 0 ) {
+            if (requestText.indexOf("\n\n") < 0) {
+                return null;
+            }
             headerEndIndex = requestText.indexOf("\n\n");
             separatorLength = 2;
-        }
-        if (headerEndIndex < 0) {
-            return null;
         }
 
         String[] lines = requestText.substring(0, headerEndIndex).split("\\r?\\n");
@@ -506,8 +494,9 @@ public class Server {
             }
         }
         for (ServerConfig serverConfig : serverConfigs) {
-            if (listensOn(serverConfig, endpoint.port) && requestedHost.equalsIgnoreCase(normalizeHost(serverConfig.host))) {
+            if (listensOn(serverConfig, endpoint.port) && requestedHost.equalsIgnoreCase(serverConfig.host == null || serverConfig.host.isBlank() ? "0.0.0.0" : serverConfig.host)) {
                 return serverConfig;
+                
             }
         }
         return endpoint.serverConfig;
@@ -541,7 +530,7 @@ public class Server {
                 continue;
             }
             if (requestedHost.equalsIgnoreCase(serverConfig.server_name)
-                    || requestedHost.equalsIgnoreCase(normalizeHost(serverConfig.host))) {
+                    || requestedHost.equalsIgnoreCase(serverConfig.host == null || serverConfig.host.isBlank() ? "0.0.0.0" : serverConfig.host)) {
                 return true;
             }
         }
@@ -577,11 +566,7 @@ public class Server {
         if (!parsedRequest.valid) {
             return error.build(serverConfig, parsedRequest, 400, "Bad Request");
         }
-
-        if (!isSupportedMethod(parsedRequest.method)) {
-            return error.build(serverConfig, parsedRequest, 405, "Method Not Allowed");
-        }
-
+        
         Router.RouteMatch routeMatch = Router.matchRoute(serverConfig, parsedRequest);
         if (routeMatch == null) {
             return error.build(serverConfig, parsedRequest, 404, "Not Found");
@@ -589,10 +574,6 @@ public class Server {
 
         if (isBodyTooLarge(serverConfig, routeMatch.route, parsedRequest)) {
             return error.build(serverConfig, parsedRequest, 413, "Request Entity Too Large");
-        }
-
-        if (routeMatch == null) {
-            return error.build(serverConfig, parsedRequest, 404, "Not Found");
         }
 
         if (routeMatch.statusCode == 405) {
@@ -634,9 +615,6 @@ public class Server {
     }
 
     private boolean isBodyTooLarge(ServerConfig serverConfig, Route route, HttpRequestParser.ParsedRequest parsedRequest) {
-        if (parsedRequest == null) {
-            return false;
-        }
         long limit = route != null && route.client_body_limit != null
                 ? route.client_body_limit
                 : serverConfig != null && serverConfig.client_body_limit > 0 ? serverConfig.client_body_limit : Long.MAX_VALUE;
@@ -1012,10 +990,7 @@ public class Server {
     }
 
     private void closeKey(SelectionKey key) {
-        Object attachment = key.attachment();
-        if (attachment instanceof ConnectionState) {
-            ((ConnectionState) attachment).cleanup();
-        }
+        if (key.attachment() instanceof ConnectionState state) state.cleanup();
         try {
             key.channel().close();
         } catch (IOException ignored) {
