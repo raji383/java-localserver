@@ -566,7 +566,7 @@ public class Server {
         if (!parsedRequest.valid) {
             return error.build(serverConfig, parsedRequest, 400, "Bad Request");
         }
-        
+
         Router.RouteMatch routeMatch = Router.matchRoute(serverConfig, parsedRequest);
         if (routeMatch == null) {
             return error.build(serverConfig, parsedRequest, 404, "Not Found");
@@ -858,10 +858,6 @@ public class Server {
         return Path.of(remainder.startsWith("/") ? remainder.substring(1) : remainder);
     }
 
-    private String serveFile(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest, Path filePath) {
-        return new String(serveFileBytes(serverConfig, parsedRequest, filePath), StandardCharsets.ISO_8859_1);
-    }
-
     private byte[] serveFileBytes(ServerConfig serverConfig, HttpRequestParser.ParsedRequest parsedRequest, Path filePath) {
         try {
             byte[] content = Files.readAllBytes(filePath);
@@ -1092,7 +1088,7 @@ public class Server {
         final long contentLength;
 
         HeaderSnapshot(String method, String target, String path, String query, String version,
-                       Map<String, String> headers, int bodyStartIndex, long contentLength) {
+                        Map<String, String> headers, int bodyStartIndex, long contentLength) {
             this.method = method;
             this.target = target;
             this.path = path;
@@ -1102,6 +1098,7 @@ public class Server {
             this.bodyStartIndex = bodyStartIndex;
             this.contentLength = contentLength;
         }
+        
     }
 
     private static final class MultipartStart {

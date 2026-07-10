@@ -52,7 +52,6 @@ public class CGIHandler {
         }
     }
 
-
     private static String sanitizeEnv(String v) {
         if (v == null)
             return "";
